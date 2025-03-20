@@ -74,6 +74,27 @@ var (
 		LabelNames:   []string{"channel", "chaincode"},
 		StatsdFormat: "%{#fqname}.%{channel}.%{chaincode}",
 	}
+
+	// New metrics for transaction dependency tracking
+	transactionsWithDependenciesCounterOpts = metrics.CounterOpts{
+		Namespace:    "endorser",
+		Name:         "transactions_with_dependencies",
+		Help:         "The number of transactions with dependencies on other transactions.",
+		LabelNames:   []string{"channel", "chaincode"},
+		StatsdFormat: "%{#fqname}.%{channel}.%{chaincode}",
+	}
+
+	dependencyMapSizeGaugeOpts = metrics.GaugeOpts{
+		Namespace: "endorser",
+		Name:      "dependency_map_size",
+		Help:      "The current size of the transaction dependency map.",
+	}
+
+	expiredDependenciesRemovedCounterOpts = metrics.CounterOpts{
+		Namespace: "endorser",
+		Name:      "expired_dependencies_removed",
+		Help:      "The number of expired transaction dependencies removed during cleanup.",
+	}
 )
 
 type Metrics struct {
@@ -86,6 +107,11 @@ type Metrics struct {
 	EndorsementsFailed       metrics.Counter
 	DuplicateTxsFailure      metrics.Counter
 	SimulationFailure        metrics.Counter
+
+	// New metrics for dependency tracking
+	TransactionsWithDependencies metrics.Counter
+	DependencyMapSize            metrics.Gauge
+	ExpiredDependenciesRemoved   metrics.Counter
 }
 
 func NewMetrics(p metrics.Provider) *Metrics {
@@ -99,5 +125,10 @@ func NewMetrics(p metrics.Provider) *Metrics {
 		EndorsementsFailed:       p.NewCounter(endorsementFailureCounterOpts),
 		DuplicateTxsFailure:      p.NewCounter(duplicateTxsFailureCounterOpts),
 		SimulationFailure:        p.NewCounter(simulationFailureCounterOpts),
+
+		// Initialize the new metrics for dependency tracking
+		TransactionsWithDependencies: p.NewCounter(transactionsWithDependenciesCounterOpts),
+		DependencyMapSize:            p.NewGauge(dependencyMapSizeGaugeOpts),
+		ExpiredDependenciesRemoved:   p.NewCounter(expiredDependenciesRemovedCounterOpts),
 	}
 }

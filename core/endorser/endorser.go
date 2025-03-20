@@ -4,17 +4,52 @@ Copyright IBM Corp. 2016 All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 */
 
+/*
+Transaction Dependency Tracking Enhancement for Hyperledger Fabric Endorser
+
+This implementation adds transaction dependency tracking to the Fabric endorser component.
+The primary features include:
+
+1. Variable Tracking: Maintains a hashmap of variables (keys) that transactions operate on,
+   along with their current values and the transaction that last modified them.
+
+2. Dependency Detection: When a transaction accesses a variable that exists in the hashmap,
+   the system marks it as dependent on the transaction that previously modified that variable.
+
+3. Dependency Information in Responses: The endorser includes dependency information in the
+   endorsement response, allowing clients to be aware of transaction dependencies.
+
+4. Expiry Mechanism: Each tracked variable has an expiry time. A background routine cleans up
+   expired entries to prevent the hashmap from growing indefinitely.
+
+5. Metrics Collection: The implementation includes metrics to track dependency-related statistics.
+
+Transaction Flow with Dependencies:
+1. Client sends transaction proposal to endorser
+2. Endorser simulates the transaction to determine which variables it operates on
+3. For each variable:
+   a. If the variable is not in the hashmap, it's added with no dependencies
+   b. If the variable is in the hashmap, the transaction is marked as dependent on the previous tx
+4. The endorser includes dependency information in the response
+5. Client can use this information to manage transaction ordering during submission
+
+This implementation helps address potential transaction conflicts and ordering issues in
+Fabric applications where transactions might operate on shared state.
+*/
+
 package endorser
 
 import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-chaincode-go/shim"
 	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
 	pb "github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric-protos-go/transientstore"
 	"github.com/hyperledger/fabric/common/flogging"
@@ -30,6 +65,14 @@ import (
 )
 
 var endorserLogger = flogging.MustGetLogger("endorser")
+
+// TransactionDependencyInfo represents information about a transaction dependency
+type TransactionDependencyInfo struct {
+	Value         []byte    // The current value of the variable
+	DependentTxID string    // ID of the transaction this depends on (if any)
+	ExpiryTime    time.Time // When this endorsement expires
+	HasDependency bool      // Whether this transaction has a dependency
+}
 
 // The Jira issue that documents Endorser flow along with its relationship to
 // the lifecycle chaincode - https://jira.hyperledger.org/browse/FAB-181
@@ -101,6 +144,70 @@ type Endorser struct {
 	Support                Support
 	PvtRWSetAssembler      PvtRWSetAssembler
 	Metrics                *Metrics
+	// New fields for transaction dependency tracking
+	VariableMap     map[string]TransactionDependencyInfo
+	VariableMapLock sync.RWMutex
+	// Configuration for endorsement expiry time
+	EndorsementExpiryDuration time.Duration
+}
+
+// NewEndorser creates a new instance of Endorser with the given dependencies
+func NewEndorser(channelFetcher ChannelFetcher, localMSP msp.IdentityDeserializer,
+	pvtDataDistributor PrivateDataDistributor, support Support,
+	pvtRWSetAssembler PvtRWSetAssembler, metrics *Metrics) *Endorser {
+	endorser := &Endorser{
+		ChannelFetcher:            channelFetcher,
+		LocalMSP:                  localMSP,
+		PrivateDataDistributor:    pvtDataDistributor,
+		Support:                   support,
+		PvtRWSetAssembler:         pvtRWSetAssembler,
+		Metrics:                   metrics,
+		VariableMap:               make(map[string]TransactionDependencyInfo),
+		EndorsementExpiryDuration: 5 * time.Minute, // Default 5 minutes endorsement expiry
+	}
+
+	// Start a background goroutine to clean up expired entries
+	go endorser.cleanupExpiredDependencies()
+
+	return endorser
+}
+
+// cleanupExpiredDependencies periodically checks for and removes expired entries from the variable map
+func (e *Endorser) cleanupExpiredDependencies() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+
+			e.VariableMapLock.Lock()
+			// Check each entry for expiration
+			removedCount := 0
+			for key, info := range e.VariableMap {
+				if now.After(info.ExpiryTime) {
+					delete(e.VariableMap, key)
+					removedCount++
+					endorserLogger.Debugf("Removed expired dependency for variable %s", key)
+				}
+			}
+
+			// Update metrics
+			if removedCount > 0 && e.Metrics.ExpiredDependenciesRemoved != nil {
+				e.Metrics.ExpiredDependenciesRemoved.Add(float64(removedCount))
+			}
+
+			if e.Metrics.DependencyMapSize != nil {
+				e.Metrics.DependencyMapSize.Set(float64(len(e.VariableMap)))
+			}
+
+			endorserLogger.Infof("Dependency cleanup completed: %d expired entries removed, current map size: %d",
+				removedCount, len(e.VariableMap))
+
+			e.VariableMapLock.Unlock()
+		}
+	}
 }
 
 // call specified chaincode (system or user)
@@ -172,6 +279,114 @@ func (e *Endorser) callChaincode(txParams *ccprovider.TransactionParams, input *
 	}
 
 	return res, ccevent, err
+}
+
+// extractTransactionDependencies identifies variables that the transaction operates on
+// from the simulation results. This is a simplified implementation - you'll need to adapt
+// this to extract the actual variables based on your application's specific data model.
+func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulationResults) (map[string][]byte, error) {
+	// This is a simplified implementation - in a real scenario, you would:
+	// 1. Analyze the read-write sets to identify the state variables
+	// 2. Extract the variable identifiers based on your application model
+	// 3. Determine the current values of those variables
+
+	dependencies := make(map[string][]byte)
+
+	// Extract variables from public state
+	if simResult.PubSimulationResults != nil {
+		for _, nsRWSet := range simResult.PubSimulationResults.NsRwset {
+			namespace := nsRWSet.Namespace
+
+			// Skip system chaincodes
+			if e.Support.IsSysCC(namespace) {
+				continue
+			}
+
+			// Extract write keys - these are the variables being modified
+			kvRWSet := &kvrwset.KVRWSet{}
+			if err := proto.Unmarshal(nsRWSet.Rwset, kvRWSet); err != nil {
+				endorserLogger.Warningf("Failed to unmarshal rwset for namespace %s: %s", namespace, err)
+				continue
+			}
+			for _, write := range kvRWSet.Writes {
+				key := namespace + ":" + string(write.Key)
+				dependencies[key] = write.Value
+				endorserLogger.Debugf("Transaction dependency identified: %s", key)
+			}
+
+			// You might also want to track read keys, as they indicate dependencies
+			// In a full implementation, you would need to decide which of these reads
+			// are critical for determining transaction dependencies
+			if kvRWSet == nil {
+				kvRWSet = &kvrwset.KVRWSet{}
+				if err := proto.Unmarshal(nsRWSet.Rwset, kvRWSet); err != nil {
+					endorserLogger.Warningf("Failed to unmarshal rwset for namespace %s: %s", namespace, err)
+					continue
+				}
+			}
+			for _, read := range kvRWSet.Reads {
+				key := namespace + ":" + string(read.Key)
+				// Only add if not already added as a write
+				if _, exists := dependencies[key]; !exists {
+					if read.Version != nil {
+						// Convert version to a byte array representation
+						versionBytes := []byte(fmt.Sprintf("%d-%d", read.Version.BlockNum, read.Version.TxNum))
+						dependencies[key] = versionBytes
+					} else {
+						dependencies[key] = []byte{}
+					}
+					endorserLogger.Debugf("Transaction read dependency identified: %s", key)
+				}
+			}
+		}
+	}
+
+	// Process private data if needed
+	// Note: For private data, you need to handle collection-specific dependencies
+	if simResult.PvtSimulationResults != nil {
+		for _, pvtRWSet := range simResult.PvtSimulationResults.NsPvtRwset {
+			namespace := pvtRWSet.Namespace
+
+			// Skip system chaincodes
+			if e.Support.IsSysCC(namespace) {
+				continue
+			}
+
+			for _, collection := range pvtRWSet.CollectionPvtRwset {
+				collectionName := collection.CollectionName
+
+				collKVRWSet := &kvrwset.KVRWSet{}
+				if err := proto.Unmarshal(collection.Rwset, collKVRWSet); err != nil {
+					endorserLogger.Warningf("Failed to unmarshal collection rwset for namespace %s, collection %s: %s",
+						namespace, collectionName, err)
+					continue
+				}
+
+				for _, write := range collKVRWSet.Writes {
+					key := namespace + ":" + collectionName + ":" + string(write.Key)
+					dependencies[key] = write.Value
+					endorserLogger.Debugf("Private data dependency identified: %s", key)
+				}
+
+				// Similarly, you might track read dependencies for private data
+				for _, read := range collKVRWSet.Reads {
+					key := namespace + ":" + collectionName + ":" + string(read.Key)
+					if _, exists := dependencies[key]; !exists {
+						if read.Version != nil {
+							// Convert version to a byte array representation
+							versionBytes := []byte(fmt.Sprintf("%d-%d", read.Version.BlockNum, read.Version.TxNum))
+							dependencies[key] = versionBytes
+						} else {
+							dependencies[key] = []byte{}
+						}
+						endorserLogger.Debugf("Private data read dependency identified: %s", key)
+					}
+				}
+			}
+		}
+	}
+
+	return dependencies, nil
 }
 
 // SimulateProposal simulates the proposal by calling the chaincode
@@ -411,6 +626,82 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 		return nil, errors.WithMessage(err, "error in simulation")
 	}
 
+	// Handle the simulation results for transaction dependency tracking
+	// Only proceed with endorsement if simulation is successful
+	if res.Status >= shim.ERROR {
+		// If simulation failed, return the response without endorsement
+		return &pb.ProposalResponse{
+			Response: res,
+		}, nil
+	}
+
+	// Extract transaction dependencies
+	simResults, err := txParams.TXSimulator.GetTxSimulationResults()
+	if err != nil {
+		return nil, errors.WithMessage(err, "error getting simulation results")
+	}
+
+	dependencies, err := e.extractTransactionDependencies(simResults)
+	if err != nil {
+		return nil, errors.WithMessage(err, "error extracting transaction dependencies")
+	}
+
+	// If no dependencies were found, we can skip the dependency tracking
+	if len(dependencies) == 0 {
+		logger.Debug("No dependencies found for transaction")
+	} else {
+		logger.Debugf("Found %d dependencies for transaction", len(dependencies))
+	}
+
+	// Check for dependencies and update the hashmap
+	hasDependency := false
+	var dependentTxID string
+
+	// Lock for concurrent access to the dependency map
+	e.VariableMapLock.Lock()
+	defer e.VariableMapLock.Unlock()
+
+	// Set the dependency map size metric
+	if e.Metrics.DependencyMapSize != nil {
+		e.Metrics.DependencyMapSize.Set(float64(len(e.VariableMap)))
+	}
+
+	// Check each variable this transaction operates on
+	for varKey, varValue := range dependencies {
+		if dependencyInfo, exists := e.VariableMap[varKey]; exists {
+			// Variable exists in the map - this transaction has a dependency
+			hasDependency = true
+			dependentTxID = dependencyInfo.DependentTxID
+
+			logger.Debugf("Transaction dependency found: %s depends on transaction %s",
+				up.ChannelHeader.TxId, dependencyInfo.DependentTxID)
+
+			// Update the variable map with new value
+			e.VariableMap[varKey] = TransactionDependencyInfo{
+				Value:         varValue,
+				DependentTxID: up.ChannelHeader.TxId,
+				ExpiryTime:    time.Now().Add(e.EndorsementExpiryDuration),
+				HasDependency: true,
+			}
+		} else {
+			// New variable, add to the map
+			logger.Debugf("New variable tracked: %s for transaction %s",
+				varKey, up.ChannelHeader.TxId)
+
+			e.VariableMap[varKey] = TransactionDependencyInfo{
+				Value:         varValue,
+				DependentTxID: up.ChannelHeader.TxId,
+				ExpiryTime:    time.Now().Add(e.EndorsementExpiryDuration),
+				HasDependency: false,
+			}
+		}
+	}
+
+	// Update metrics
+	if hasDependency && e.Metrics.TransactionsWithDependencies != nil {
+		e.Metrics.TransactionsWithDependencies.Add(1)
+	}
+
 	cceventBytes, err := CreateCCEventBytes(ccevent)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to marshal chaincode event")
@@ -424,6 +715,9 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 		logger.Warning("Failed marshaling the proposal response payload to bytes", err)
 		return nil, errors.WithMessage(err, "failed to create the proposal response")
 	}
+
+	// At this point, the transaction has been successfully simulated and we have extracted
+	// the dependencies. Now we need to endorse the transaction and include the dependency info.
 
 	// if error, capture endorsement failure metric
 	meterLabels := []string{
@@ -466,12 +760,21 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 		return nil, errors.WithMessage(err, "endorsing with plugin failed")
 	}
 
+	// In a real implementation, you might want to use a more structured approach,
+	// such as adding these fields to the TransactionEndorsement message or
+	// using the Metadata field in the ProposalResponse
+
+	res.Message = fmt.Sprintf("%s; DependencyInfo:HasDependency=%v,DependentTxID=%s,ExpiryTime=%d",
+		res.Message, hasDependency, dependentTxID, time.Now().Add(e.EndorsementExpiryDuration).Unix())
+
 	return &pb.ProposalResponse{
 		Version:     1,
 		Endorsement: endorsement,
 		Payload:     mPrpBytes,
 		Response:    res,
 		Interest:    ccInterest,
+		// Include the dependency information as a custom field
+		// In a production system, you would likely modify the Fabric protos to include these fields directly
 	}, nil
 }
 

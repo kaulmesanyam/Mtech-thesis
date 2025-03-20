@@ -9,6 +9,7 @@ package e2e
 import (
 	"io/ioutil"
 	"os"
+	"runtime"
 	"syscall"
 
 	docker "github.com/fsouza/go-dockerclient"
@@ -65,6 +66,11 @@ var _ = Describe("SignalHandling", func() {
 	})
 
 	It("handles signals", func() {
+
+		if runtime.GOOS == "windows" {
+			Skip("This test requires SIGUSR1 which is not available on Windows")
+		}
+
 		By("verifying SIGUSR1 to the peer dumps go routines")
 		peerProcess.Signal(syscall.SIGUSR1)
 		Eventually(peerRunner.Err(), network.EventuallyTimeout).Should(gbytes.Say("Received signal: "))

@@ -1,7 +1,6 @@
 module github.com/hyperledger/fabric
 
-go 1.23.5
-
+go 1.23
 require (
 	code.cloudfoundry.org/clock v1.0.0
 	github.com/IBM/idemix v0.0.2-0.20231011101252-a4feda90f3f7
