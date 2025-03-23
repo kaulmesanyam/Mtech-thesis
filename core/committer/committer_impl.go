@@ -12,7 +12,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
 	"github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/ledger"
@@ -228,46 +231,31 @@ func BuildDAGFromBlock(block *common.Block) (*TransactionDAG, error) {
 			continue
 		}
 
-		// By default, assume no dependency
+		// Extract dependency information from transaction actions
 		hasDependency := false
 		dependentTxID := ""
 
-		// Extract dependency information from transaction actions
 		for _, action := range tx.Actions {
-			// Extract the action payload
-			actionPayload, err := protoutil.UnmarshalChaincodeActionPayload(action.Payload)
-			if err != nil {
-				logger.Warningf("Failed to unmarshal action payload for tx %s: %s", txID, err)
-				continue
-			}
-
-			// Extract endorsement response
-			proposalResponsePayload, err := protoutil.UnmarshalProposalResponsePayload(actionPayload.Action.ProposalResponsePayload)
-			if err != nil {
-				logger.Warningf("Failed to unmarshal proposal response payload for tx %s: %s", txID, err)
-				continue
-			}
-
-			// Extract chaincode action
-			chaincodeAction, err := protoutil.UnmarshalChaincodeAction(proposalResponsePayload.Extension)
-			if err != nil {
+			chaincodeAction := &peer.ChaincodeAction{}
+			if err := proto.Unmarshal(action.Payload, chaincodeAction); err != nil {
 				logger.Warningf("Failed to unmarshal chaincode action for tx %s: %s", txID, err)
 				continue
 			}
 
-			// Check if response contains dependency info
+			// Extract dependency information from the response message
 			if chaincodeAction.Response != nil && chaincodeAction.Response.Message != "" {
-				// Parse dependency info from message
-				depHasDependency, depDependentTxID, _, err := ParseDependencyInfo(chaincodeAction.Response.Message)
-				if err == nil {
-					hasDependency = depHasDependency
-					dependentTxID = depDependentTxID
-					break // Found dependency info, no need to check other actions
+				hasDependency, dependentTxID, _, err = ParseDependencyInfo(chaincodeAction.Response.Message)
+				if err != nil {
+					logger.Warningf("Failed to parse dependency info for tx %s: %s", txID, err)
+					continue
+				}
+				if hasDependency {
+					break
 				}
 			}
 		}
 
-		// Add the transaction to the DAG
+		// Add transaction to DAG
 		dag.AddTransaction(txID, i, hasDependency, dependentTxID)
 	}
 
@@ -396,7 +384,7 @@ func (lc *LedgerCommitter) legacyCommit(blockAndPvtData *ledger.BlockAndPvtData,
 	return nil
 }
 
-// processBlockWithDAG processes a block using the DAG-based approach
+// processBlockWithDAG processes a block using the transaction dependency DAG
 func (lc *LedgerCommitter) processBlockWithDAG(blockAndPvtData *ledger.BlockAndPvtData,
 	commitOpts *ledger.CommitOptions, dag *TransactionDAG) error {
 
@@ -464,12 +452,95 @@ func (lc *LedgerCommitter) processBlockWithDAG(blockAndPvtData *ledger.BlockAndP
 					return
 				}
 
-				// In a real implementation, you would apply your validation logic here
-				// For this implementation, we'll consider all transactions as valid
-				// This is where you would integrate with Fabric's validation system
+				// Extract the transaction envelope
+				txEnvelopeBytes := blockAndPvtData.Block.Data.Data[txIndex]
+				env, err := protoutil.GetEnvelopeFromBlock(txEnvelopeBytes)
+				if err != nil {
+					logger.Errorf("Failed to get envelope for tx %s: %s", id, err)
+					mutex.Lock()
+					txValidationResults[id] = false
+					mutex.Unlock()
+					dag.SetValidationResult(id, false)
+					return
+				}
 
-				// Mark as valid
+				// Extract the payload
+				payload, err := protoutil.UnmarshalPayload(env.Payload)
+				if err != nil {
+					logger.Errorf("Failed to unmarshal payload for tx %s: %s", id, err)
+					mutex.Lock()
+					txValidationResults[id] = false
+					mutex.Unlock()
+					dag.SetValidationResult(id, false)
+					return
+				}
+
+				// Extract the transaction
+				tx, err := protoutil.UnmarshalTransaction(payload.Data)
+				if err != nil {
+					logger.Errorf("Failed to unmarshal transaction for tx %s: %s", id, err)
+					mutex.Lock()
+					txValidationResults[id] = false
+					mutex.Unlock()
+					dag.SetValidationResult(id, false)
+					return
+				}
+
+				// Validate chaincode actions
 				isValid := true
+				for _, action := range tx.Actions {
+					chaincodeAction := &peer.ChaincodeAction{}
+					if err := proto.Unmarshal(action.Payload, chaincodeAction); err != nil {
+						logger.Errorf("Failed to unmarshal chaincode action for tx %s: %s", id, err)
+						isValid = false
+						break
+					}
+
+					// Check chaincode response status
+					if chaincodeAction.Response == nil || chaincodeAction.Response.Status != 200 {
+						logger.Errorf("Chaincode action failed for tx %s with status %d", id,
+							chaincodeAction.Response.GetStatus())
+						isValid = false
+						break
+					}
+				}
+
+				// Check for read/write set conflicts with dependencies
+				if level > 0 && isValid {
+					node := dag.Nodes[id]
+					for _, depTxID := range node.DependentTxIDs {
+						// Get the dependent transaction
+						depTxIndex, exists := dag.GetIndexByTxID(depTxID)
+						if !exists {
+							continue
+						}
+
+						// Extract the dependent transaction
+						depTxEnvelopeBytes := blockAndPvtData.Block.Data.Data[depTxIndex]
+						depEnv, err := protoutil.GetEnvelopeFromBlock(depTxEnvelopeBytes)
+						if err != nil {
+							continue
+						}
+
+						depPayload, err := protoutil.UnmarshalPayload(depEnv.Payload)
+						if err != nil {
+							continue
+						}
+
+						depTx, err := protoutil.UnmarshalTransaction(depPayload.Data)
+						if err != nil {
+							continue
+						}
+
+						// Check for read/write set conflicts
+						if lc.checkRWSetConflicts(tx, depTx) {
+							logger.Infof("Transaction %s marked as invalid due to read/write set conflict with dependency %s",
+								id, depTxID)
+							isValid = false
+							break
+						}
+					}
+				}
 
 				// Set the result
 				mutex.Lock()
@@ -490,8 +561,6 @@ func (lc *LedgerCommitter) processBlockWithDAG(blockAndPvtData *ledger.BlockAndP
 	}
 
 	// After DAG-based processing, update the transaction validation flags in the block
-	// In Fabric, this is done in the txvalidator package, but we'll simulate it here
-	// Get the validation flags from block metadata
 	metadata := blockAndPvtData.Block.Metadata
 	if len(metadata.Metadata) <= int(common.BlockMetadataIndex_TRANSACTIONS_FILTER) {
 		metadata.Metadata = append(metadata.Metadata, []byte{})
@@ -510,8 +579,7 @@ func (lc *LedgerCommitter) processBlockWithDAG(blockAndPvtData *ledger.BlockAndP
 		}
 
 		if !dag.IsValid(txID) {
-			// Mark as invalid - in this case we'll use MVCC_READ_CONFLICT as an example
-			// In a real implementation, you'd use the appropriate validation code
+			// Mark as invalid with appropriate validation code
 			txFilter[txIndex] = uint8(peer.TxValidationCode_MVCC_READ_CONFLICT)
 		}
 	}
@@ -580,4 +648,181 @@ func (lc *LedgerCommitter) CommitPvtDataOfOldBlocks(reconciledPvtdata []*ledger.
 // Close closes the committer
 func (lc *LedgerCommitter) Close() {
 	lc.PeerLedgerSupport.Close()
+}
+
+// checkRWSetConflicts checks for read/write set conflicts between transactions
+func (lc *LedgerCommitter) checkRWSetConflicts(tx1, tx2 *peer.Transaction) bool {
+	// Extract RW sets from both transactions
+	ns1Map, err := extractRWSet(tx1)
+	if err != nil {
+		logger.Errorf("Failed to extract RW set from tx1: %v", err)
+		return false
+	}
+
+	ns2Map, err := extractRWSet(tx2)
+	if err != nil {
+		logger.Errorf("Failed to extract RW set from tx2: %v", err)
+		return false
+	}
+
+	// Check for conflicts in each namespace
+	for ns1, ns1Data := range ns1Map {
+		ns2Data, exists := ns2Map[ns1]
+		if !exists {
+			continue // No conflict if namespaces don't overlap
+		}
+
+		// Unmarshal RW sets
+		kvrw1 := &kvrwset.KVRWSet{}
+		if err := proto.Unmarshal(ns1Data.Rwset, kvrw1); err != nil {
+			logger.Errorf("Failed to unmarshal RW set for ns1: %v", err)
+			return false
+		}
+
+		kvrw2 := &kvrwset.KVRWSet{}
+		if err := proto.Unmarshal(ns2Data.Rwset, kvrw2); err != nil {
+			logger.Errorf("Failed to unmarshal RW set for ns2: %v", err)
+			return false
+		}
+
+		// Check for conflicts in public read/write sets
+		if hasConflictInKVRWSet(kvrw1.Reads, kvrw2.Writes) ||
+			hasConflictInKVRWSet(kvrw2.Reads, kvrw1.Writes) ||
+			hasWriteWriteConflict(kvrw1.Writes, kvrw2.Writes) {
+			return true
+		}
+
+		// Check for conflicts in private read/write sets
+		for _, coll1 := range ns1Data.CollectionHashedRwset {
+			hashedRW1 := &kvrwset.HashedRWSet{}
+			if err := proto.Unmarshal(coll1.HashedRwset, hashedRW1); err != nil {
+				logger.Errorf("Failed to unmarshal hashed RW set for collection %s: %v", coll1.CollectionName, err)
+				continue
+			}
+
+			for _, coll2 := range ns2Data.CollectionHashedRwset {
+				if coll1.CollectionName != coll2.CollectionName {
+					continue
+				}
+
+				hashedRW2 := &kvrwset.HashedRWSet{}
+				if err := proto.Unmarshal(coll2.HashedRwset, hashedRW2); err != nil {
+					logger.Errorf("Failed to unmarshal hashed RW set for collection %s: %v", coll2.CollectionName, err)
+					continue
+				}
+
+				if hasConflictInHashedRWSet(hashedRW1.HashedReads, hashedRW2.HashedWrites) ||
+					hasConflictInHashedRWSet(hashedRW2.HashedReads, hashedRW1.HashedWrites) ||
+					hasHashedWriteWriteConflict(hashedRW1.HashedWrites, hashedRW2.HashedWrites) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// hasConflictInKVRWSet checks for conflicts between reads and writes in KVRWSet
+func hasConflictInKVRWSet(reads []*kvrwset.KVRead, writes []*kvrwset.KVWrite) bool {
+	// Create a map of write keys for efficient lookup
+	writeKeys := make(map[string]struct{})
+	for _, w := range writes {
+		writeKeys[w.Key] = struct{}{}
+	}
+
+	// Check if any read key exists in writes
+	for _, r := range reads {
+		if _, exists := writeKeys[r.Key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// hasConflictInHashedRWSet checks for conflicts between hashed reads and writes
+func hasConflictInHashedRWSet(reads []*kvrwset.KVReadHash, writes []*kvrwset.KVWriteHash) bool {
+	// Create a map of write key hashes for efficient lookup
+	writeKeyHashes := make(map[string]struct{})
+	for _, w := range writes {
+		writeKeyHashes[string(w.KeyHash)] = struct{}{}
+	}
+
+	// Check if any read key hash exists in writes
+	for _, r := range reads {
+		if _, exists := writeKeyHashes[string(r.KeyHash)]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// hasWriteWriteConflict checks for conflicts between two write sets
+func hasWriteWriteConflict(writes1 []*kvrwset.KVWrite, writes2 []*kvrwset.KVWrite) bool {
+	// Create a map of write keys from the first set
+	writeKeys := make(map[string]struct{})
+	for _, w := range writes1 {
+		writeKeys[w.Key] = struct{}{}
+	}
+
+	// Check if any key from second set exists in first set
+	for _, w := range writes2 {
+		if _, exists := writeKeys[w.Key]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHashedWriteWriteConflict checks for conflicts between two hashed write sets
+func hasHashedWriteWriteConflict(writes1 []*kvrwset.KVWriteHash, writes2 []*kvrwset.KVWriteHash) bool {
+	// Create a map of write key hashes from the first set
+	writeKeyHashes := make(map[string]struct{})
+	for _, w := range writes1 {
+		writeKeyHashes[string(w.KeyHash)] = struct{}{}
+	}
+
+	// Check if any key hash from second set exists in first set
+	for _, w := range writes2 {
+		if _, exists := writeKeyHashes[string(w.KeyHash)]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// extractRWSet extracts read/write sets from a transaction
+func extractRWSet(tx *peer.Transaction) (map[string]*rwset.NsReadWriteSet, error) {
+	rwSets := make(map[string]*rwset.NsReadWriteSet)
+
+	for _, action := range tx.Actions {
+		chaincodeAction := &peer.ChaincodeAction{}
+		if err := proto.Unmarshal(action.Payload, chaincodeAction); err != nil {
+			return nil, err
+		}
+
+		// Extract read/write set from chaincode action
+		if chaincodeAction.Results == nil {
+			continue
+		}
+
+		txRWSet := &rwset.TxReadWriteSet{}
+		if err := proto.Unmarshal(chaincodeAction.Results, txRWSet); err != nil {
+			return nil, err
+		}
+
+		// Process each namespace's read/write set
+		for _, nsRWSet := range txRWSet.NsRwset {
+			ns := nsRWSet.Namespace
+			if _, exists := rwSets[ns]; !exists {
+				rwSets[ns] = &rwset.NsReadWriteSet{
+					Namespace:             ns,
+					Rwset:                 nsRWSet.Rwset,
+					CollectionHashedRwset: nsRWSet.CollectionHashedRwset,
+				}
+			}
+		}
+	}
+
+	return rwSets, nil
 }

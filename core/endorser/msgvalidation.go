@@ -121,7 +121,7 @@ func UnpackProposal(signedProp *peer.SignedProposal) (*UnpackedProposal, error) 
 }
 
 func (up *UnpackedProposal) Validate(idDeserializer msp.IdentityDeserializer) error {
-	logger := decorateLogger(endorserLogger, &ccprovider.TransactionParams{
+	logger := decorateLogger(logger, &ccprovider.TransactionParams{
 		ChannelID: up.ChannelHeader.ChannelId,
 		TxID:      up.TxID(),
 	})

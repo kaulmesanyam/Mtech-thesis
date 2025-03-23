@@ -6,7 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 
 package endorser
 
-import "github.com/hyperledger/fabric/common/metrics"
+import (
+	"github.com/hyperledger/fabric/common/metrics"
+)
 
 var (
 	proposalDurationHistogramOpts = metrics.HistogramOpts{
@@ -95,8 +97,28 @@ var (
 		Name:      "expired_dependencies_removed",
 		Help:      "The number of expired transaction dependencies removed during cleanup.",
 	}
+
+	// Circuit breaker metrics
+	leaderCircuitBreakerOpenCounterOpts = metrics.CounterOpts{
+		Namespace: "endorser",
+		Name:      "leader_circuit_breaker_open",
+		Help:      "The number of times the leader circuit breaker has opened.",
+	}
+
+	leaderCircuitBreakerHalfOpenCounterOpts = metrics.CounterOpts{
+		Namespace: "endorser",
+		Name:      "leader_circuit_breaker_half_open",
+		Help:      "The number of times the leader circuit breaker has entered half-open state.",
+	}
+
+	leaderCircuitBreakerClosedCounterOpts = metrics.CounterOpts{
+		Namespace: "endorser",
+		Name:      "leader_circuit_breaker_closed",
+		Help:      "The number of times the leader circuit breaker has closed.",
+	}
 )
 
+// Metrics contains all the metrics for the endorser
 type Metrics struct {
 	ProposalDuration         metrics.Histogram
 	ProposalsReceived        metrics.Counter
@@ -112,23 +134,34 @@ type Metrics struct {
 	TransactionsWithDependencies metrics.Counter
 	DependencyMapSize            metrics.Gauge
 	ExpiredDependenciesRemoved   metrics.Counter
+
+	// Circuit breaker metrics
+	LeaderCircuitBreakerOpen     metrics.Counter
+	LeaderCircuitBreakerHalfOpen metrics.Counter
+	LeaderCircuitBreakerClosed   metrics.Counter
 }
 
-func NewMetrics(p metrics.Provider) *Metrics {
+// NewMetrics creates a new Metrics instance
+func NewMetrics(provider metrics.Provider) *Metrics {
 	return &Metrics{
-		ProposalDuration:         p.NewHistogram(proposalDurationHistogramOpts),
-		ProposalsReceived:        p.NewCounter(receivedProposalsCounterOpts),
-		SuccessfulProposals:      p.NewCounter(successfulProposalsCounterOpts),
-		ProposalValidationFailed: p.NewCounter(proposalValidationFailureCounterOpts),
-		ProposalACLCheckFailed:   p.NewCounter(proposalChannelACLFailureOpts),
-		InitFailed:               p.NewCounter(initFailureCounterOpts),
-		EndorsementsFailed:       p.NewCounter(endorsementFailureCounterOpts),
-		DuplicateTxsFailure:      p.NewCounter(duplicateTxsFailureCounterOpts),
-		SimulationFailure:        p.NewCounter(simulationFailureCounterOpts),
+		ProposalDuration:         provider.NewHistogram(proposalDurationHistogramOpts),
+		ProposalsReceived:        provider.NewCounter(receivedProposalsCounterOpts),
+		SuccessfulProposals:      provider.NewCounter(successfulProposalsCounterOpts),
+		ProposalValidationFailed: provider.NewCounter(proposalValidationFailureCounterOpts),
+		ProposalACLCheckFailed:   provider.NewCounter(proposalChannelACLFailureOpts),
+		InitFailed:               provider.NewCounter(initFailureCounterOpts),
+		EndorsementsFailed:       provider.NewCounter(endorsementFailureCounterOpts),
+		DuplicateTxsFailure:      provider.NewCounter(duplicateTxsFailureCounterOpts),
+		SimulationFailure:        provider.NewCounter(simulationFailureCounterOpts),
 
 		// Initialize the new metrics for dependency tracking
-		TransactionsWithDependencies: p.NewCounter(transactionsWithDependenciesCounterOpts),
-		DependencyMapSize:            p.NewGauge(dependencyMapSizeGaugeOpts),
-		ExpiredDependenciesRemoved:   p.NewCounter(expiredDependenciesRemovedCounterOpts),
+		TransactionsWithDependencies: provider.NewCounter(transactionsWithDependenciesCounterOpts),
+		DependencyMapSize:            provider.NewGauge(dependencyMapSizeGaugeOpts),
+		ExpiredDependenciesRemoved:   provider.NewCounter(expiredDependenciesRemovedCounterOpts),
+
+		// Circuit breaker metrics
+		LeaderCircuitBreakerOpen:     provider.NewCounter(leaderCircuitBreakerOpenCounterOpts),
+		LeaderCircuitBreakerHalfOpen: provider.NewCounter(leaderCircuitBreakerHalfOpenCounterOpts),
+		LeaderCircuitBreakerClosed:   provider.NewCounter(leaderCircuitBreakerClosedCounterOpts),
 	}
 }

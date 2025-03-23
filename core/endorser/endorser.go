@@ -62,9 +62,20 @@ import (
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-var endorserLogger = flogging.MustGetLogger("endorser")
+var logger = flogging.MustGetLogger("endorser")
+
+// CircuitState represents the state of a circuit breaker
+type CircuitState int
+
+const (
+	CircuitClosed   CircuitState = iota // Normal operation
+	CircuitOpen                         // Failing, reject all requests
+	CircuitHalfOpen                     // Testing if service recovered
+)
 
 // TransactionDependencyInfo represents information about a transaction dependency
 type TransactionDependencyInfo struct {
@@ -72,6 +83,13 @@ type TransactionDependencyInfo struct {
 	DependentTxID string    // ID of the transaction this depends on (if any)
 	ExpiryTime    time.Time // When this endorsement expires
 	HasDependency bool      // Whether this transaction has a dependency
+}
+
+// DependencyInfo represents the dependency information for a transaction
+type DependencyInfo struct {
+	Value         []byte
+	DependentTxID string
+	HasDependency bool
 }
 
 // The Jira issue that documents Endorser flow along with its relationship to
@@ -136,6 +154,118 @@ type Channel struct {
 	IdentityDeserializer msp.IdentityDeserializer
 }
 
+// EndorserRole represents the role of an endorser in the network
+type EndorserRole int
+
+const (
+	NormalEndorser EndorserRole = iota
+	LeaderEndorser
+)
+
+// EndorserConfig contains configuration for the endorser
+type EndorserConfig struct {
+	Role           EndorserRole
+	LeaderEndorser string // Address of the leader endorser
+	EndorserID     string // Unique ID of this endorser
+	ChannelID      string // Channel ID this endorser belongs to
+}
+
+// HealthStatus represents the health status of the endorser
+type HealthStatus struct {
+	IsHealthy     bool
+	LastCheckTime time.Time
+	Details       map[string]interface{}
+}
+
+// CircuitBreakerConfig contains configuration for the circuit breaker
+type CircuitBreakerConfig struct {
+	Threshold     int           // Number of failures before opening the circuit
+	Timeout       time.Duration // Time to wait before attempting recovery
+	MaxRetries    int           // Maximum number of retries in half-open state
+	RetryInterval time.Duration // Time between retries in half-open state
+}
+
+// DefaultCircuitBreakerConfig returns default circuit breaker configuration
+func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
+	return CircuitBreakerConfig{
+		Threshold:     5,
+		Timeout:       30 * time.Second,
+		MaxRetries:    3,
+		RetryInterval: 5 * time.Second,
+	}
+}
+
+// CircuitBreaker implements a circuit breaker pattern for leader communication
+type CircuitBreaker struct {
+	failures        int
+	lastFailureTime time.Time
+	config          CircuitBreakerConfig
+	state           CircuitState
+	mu              sync.RWMutex
+	metrics         *Metrics
+	retryCount      int
+}
+
+// NewCircuitBreaker creates a new circuit breaker instance
+func NewCircuitBreaker(config CircuitBreakerConfig, metrics *Metrics) *CircuitBreaker {
+	return &CircuitBreaker{
+		config:  config,
+		state:   CircuitClosed,
+		metrics: metrics,
+	}
+}
+
+// Execute wraps an operation with circuit breaker logic
+func (cb *CircuitBreaker) Execute(operation func() error) error {
+	cb.mu.RLock()
+	if cb.state == CircuitOpen {
+		if time.Since(cb.lastFailureTime) < cb.config.Timeout {
+			cb.mu.RUnlock()
+			cb.metrics.LeaderCircuitBreakerOpen.Add(1)
+			return fmt.Errorf("circuit breaker is open")
+		}
+		cb.mu.RUnlock()
+		cb.mu.Lock()
+		cb.state = CircuitHalfOpen
+		cb.retryCount = 0
+		cb.mu.Unlock()
+		cb.metrics.LeaderCircuitBreakerHalfOpen.Add(1)
+	} else {
+		cb.mu.RUnlock()
+	}
+
+	err := operation()
+	if err != nil {
+		cb.mu.Lock()
+		cb.failures++
+		if cb.state == CircuitHalfOpen {
+			cb.state = CircuitOpen
+			cb.lastFailureTime = time.Now()
+			cb.metrics.LeaderCircuitBreakerOpen.Add(1)
+		} else if cb.failures >= cb.config.Threshold {
+			cb.state = CircuitOpen
+			cb.lastFailureTime = time.Now()
+			cb.metrics.LeaderCircuitBreakerOpen.Add(1)
+		}
+		cb.mu.Unlock()
+		return err
+	}
+
+	cb.mu.Lock()
+	cb.failures = 0
+	cb.state = CircuitClosed
+	cb.mu.Unlock()
+	cb.metrics.LeaderCircuitBreakerClosed.Add(1)
+	return nil
+}
+
+// GetState returns the current state of the circuit breaker
+func (cb *CircuitBreaker) GetState() CircuitState {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
+
 // Endorser provides the Endorser service ProcessProposal
 type Endorser struct {
 	ChannelFetcher         ChannelFetcher
@@ -144,17 +274,34 @@ type Endorser struct {
 	Support                Support
 	PvtRWSetAssembler      PvtRWSetAssembler
 	Metrics                *Metrics
-	// New fields for transaction dependency tracking
-	VariableMap     map[string]TransactionDependencyInfo
-	VariableMapLock sync.RWMutex
-	// Configuration for endorsement expiry time
+	Config                 EndorserConfig
+	// Leader-specific fields
+	VariableMap               map[string]TransactionDependencyInfo
+	VariableMapLock           sync.RWMutex
 	EndorsementExpiryDuration time.Duration
+	// Channel for receiving transactions from normal endorsers
+	TxChannel chan *pb.ProposalResponse
+	// Channel for sending processed transactions back to normal endorsers
+	ResponseChannel chan *pb.ProposalResponse
+	// Map to track transactions being processed by normal endorsers
+	ProcessingTxs  map[string]*pb.ProposalResponse
+	ProcessingLock sync.RWMutex
+	// Health check related fields
+	HealthStatus     *HealthStatus
+	HealthCheckLock  sync.RWMutex
+	LastLeaderCheck  time.Time
+	LeaderCheckError error
+	// Circuit breaker for leader communication
+	LeaderCircuitBreaker *CircuitBreaker
+	// Shutdown related fields
+	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewEndorser creates a new instance of Endorser with the given dependencies
 func NewEndorser(channelFetcher ChannelFetcher, localMSP msp.IdentityDeserializer,
 	pvtDataDistributor PrivateDataDistributor, support Support,
-	pvtRWSetAssembler PvtRWSetAssembler, metrics *Metrics) *Endorser {
+	pvtRWSetAssembler PvtRWSetAssembler, metrics *Metrics, config EndorserConfig) *Endorser {
 	endorser := &Endorser{
 		ChannelFetcher:            channelFetcher,
 		LocalMSP:                  localMSP,
@@ -162,14 +309,48 @@ func NewEndorser(channelFetcher ChannelFetcher, localMSP msp.IdentityDeserialize
 		Support:                   support,
 		PvtRWSetAssembler:         pvtRWSetAssembler,
 		Metrics:                   metrics,
+		Config:                    config,
 		VariableMap:               make(map[string]TransactionDependencyInfo),
-		EndorsementExpiryDuration: 5 * time.Minute, // Default 5 minutes endorsement expiry
+		EndorsementExpiryDuration: 5 * time.Minute,
+		TxChannel:                 make(chan *pb.ProposalResponse, 1000),
+		ResponseChannel:           make(chan *pb.ProposalResponse, 1000),
+		ProcessingTxs:             make(map[string]*pb.ProposalResponse),
+		HealthStatus: &HealthStatus{
+			IsHealthy:     true,
+			LastCheckTime: time.Now(),
+			Details:       make(map[string]interface{}),
+		},
+		LeaderCircuitBreaker: NewCircuitBreaker(DefaultCircuitBreakerConfig(), metrics),
+		stopChan:             make(chan struct{}),
 	}
 
-	// Start a background goroutine to clean up expired entries
-	go endorser.cleanupExpiredDependencies()
+	// Start leader-specific goroutines if this is a leader endorser
+	if config.Role == LeaderEndorser {
+		endorser.wg.Add(2)
+		go func() {
+			defer endorser.wg.Done()
+			endorser.cleanupExpiredDependencies()
+		}()
+		go func() {
+			defer endorser.wg.Done()
+			endorser.processTransactions()
+		}()
+	}
+
+	// Start health check goroutine
+	endorser.wg.Add(1)
+	go func() {
+		defer endorser.wg.Done()
+		endorser.runHealthChecks()
+	}()
 
 	return endorser
+}
+
+// Shutdown gracefully stops the endorser
+func (e *Endorser) Shutdown() {
+	close(e.stopChan)
+	e.wg.Wait()
 }
 
 // cleanupExpiredDependencies periodically checks for and removes expired entries from the variable map
@@ -179,41 +360,133 @@ func (e *Endorser) cleanupExpiredDependencies() {
 
 	for {
 		select {
+		case <-e.stopChan:
+			return
 		case <-ticker.C:
 			now := time.Now()
-
-			e.VariableMapLock.Lock()
-			// Check each entry for expiration
 			removedCount := 0
+
+			// Use a separate map to store entries to remove to avoid holding the lock too long
+			entriesToRemove := make([]string, 0)
+
+			// First pass: identify expired entries
+			e.VariableMapLock.RLock()
 			for key, info := range e.VariableMap {
 				if now.After(info.ExpiryTime) {
-					delete(e.VariableMap, key)
+					entriesToRemove = append(entriesToRemove, key)
 					removedCount++
-					endorserLogger.Debugf("Removed expired dependency for variable %s", key)
+					logger.Debugf("Marked expired dependency for variable %s", key)
 				}
 			}
+			e.VariableMapLock.RUnlock()
 
-			// Update metrics
-			if removedCount > 0 && e.Metrics.ExpiredDependenciesRemoved != nil {
-				e.Metrics.ExpiredDependenciesRemoved.Add(float64(removedCount))
+			// Second pass: remove expired entries
+			if len(entriesToRemove) > 0 {
+				e.VariableMapLock.Lock()
+				for _, key := range entriesToRemove {
+					delete(e.VariableMap, key)
+				}
+
+				// Update metrics
+				if e.Metrics.ExpiredDependenciesRemoved != nil {
+					e.Metrics.ExpiredDependenciesRemoved.Add(float64(removedCount))
+				}
+
+				if e.Metrics.DependencyMapSize != nil {
+					e.Metrics.DependencyMapSize.Set(float64(len(e.VariableMap)))
+				}
+
+				logger.Infof("Dependency cleanup completed: %d expired entries removed, current map size: %d",
+					removedCount, len(e.VariableMap))
+
+				e.VariableMapLock.Unlock()
 			}
-
-			if e.Metrics.DependencyMapSize != nil {
-				e.Metrics.DependencyMapSize.Set(float64(len(e.VariableMap)))
-			}
-
-			endorserLogger.Infof("Dependency cleanup completed: %d expired entries removed, current map size: %d",
-				removedCount, len(e.VariableMap))
-
-			e.VariableMapLock.Unlock()
 		}
 	}
+}
+
+// processTransactions handles transaction processing for the leader endorser
+func (e *Endorser) processTransactions() {
+	for {
+		select {
+		case <-e.stopChan:
+			return
+		case tx := <-e.TxChannel:
+			// Process the transaction
+			processedTx, err := e.processTransaction(tx)
+			if err != nil {
+				logger.Errorf("Error processing transaction: %v", err)
+				continue
+			}
+			// Send processed transaction back to normal endorsers
+			e.ResponseChannel <- processedTx
+		}
+	}
+}
+
+// extractDependencyInfo extracts dependency information from a transaction
+func (e *Endorser) extractDependencyInfo(tx *pb.ProposalResponse) (*DependencyInfo, error) {
+	// Extract the chaincode action
+	chaincodeAction := &pb.ChaincodeAction{}
+	if err := proto.Unmarshal(tx.Payload, chaincodeAction); err != nil {
+		return nil, err
+	}
+
+	// Extract read/write set
+	rwSet := &kvrwset.KVRWSet{}
+	if err := proto.Unmarshal(chaincodeAction.Results, rwSet); err != nil {
+		return nil, err
+	}
+
+	// Analyze read/write set to determine dependencies
+	depInfo := &DependencyInfo{
+		HasDependency: false,
+	}
+
+	// Check for dependencies in the read set
+	for _, read := range rwSet.Reads {
+		e.VariableMapLock.RLock()
+		if info, exists := e.VariableMap[read.Key]; exists {
+			depInfo.HasDependency = true
+			depInfo.DependentTxID = info.DependentTxID
+			depInfo.Value = info.Value
+		}
+		e.VariableMapLock.RUnlock()
+	}
+
+	return depInfo, nil
+}
+
+// processTransaction processes a single transaction in the leader endorser
+func (e *Endorser) processTransaction(tx *pb.ProposalResponse) (*pb.ProposalResponse, error) {
+	// Extract transaction ID and dependency information
+	txID := util.GenerateUUID()
+	depInfo, err := e.extractDependencyInfo(tx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update variable map with new transaction
+	e.VariableMapLock.Lock()
+	e.VariableMap[txID] = TransactionDependencyInfo{
+		Value:         depInfo.Value,
+		DependentTxID: depInfo.DependentTxID,
+		ExpiryTime:    time.Now().Add(e.EndorsementExpiryDuration),
+		HasDependency: depInfo.HasDependency,
+	}
+	e.VariableMapLock.Unlock()
+
+	// Add dependency information to response
+	tx.Response.Message = fmt.Sprintf("DependencyInfo:HasDependency=%v,DependentTxID=%s,ExpiryTime=%d",
+		depInfo.HasDependency, depInfo.DependentTxID, time.Now().Add(e.EndorsementExpiryDuration).Unix())
+
+	return tx, nil
 }
 
 // call specified chaincode (system or user)
 func (e *Endorser) callChaincode(txParams *ccprovider.TransactionParams, input *pb.ChaincodeInput, chaincodeName string) (*pb.Response, *pb.ChaincodeEvent, error) {
 	defer func(start time.Time) {
-		logger := endorserLogger.WithOptions(zap.AddCallerSkip(1))
+		logger := logger.WithOptions(zap.AddCallerSkip(1))
 		logger = decorateLogger(logger, txParams)
 		elapsedMillisec := time.Since(start).Milliseconds()
 		logger.Infof("finished chaincode: %s duration: %dms", chaincodeName, elapsedMillisec)
@@ -305,13 +578,13 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 			// Extract write keys - these are the variables being modified
 			kvRWSet := &kvrwset.KVRWSet{}
 			if err := proto.Unmarshal(nsRWSet.Rwset, kvRWSet); err != nil {
-				endorserLogger.Warningf("Failed to unmarshal rwset for namespace %s: %s", namespace, err)
+				logger.Warningf("Failed to unmarshal rwset for namespace %s: %s", namespace, err)
 				continue
 			}
 			for _, write := range kvRWSet.Writes {
 				key := namespace + ":" + string(write.Key)
 				dependencies[key] = write.Value
-				endorserLogger.Debugf("Transaction dependency identified: %s", key)
+				logger.Debugf("Transaction dependency identified: %s", key)
 			}
 
 			// You might also want to track read keys, as they indicate dependencies
@@ -320,7 +593,7 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 			if kvRWSet == nil {
 				kvRWSet = &kvrwset.KVRWSet{}
 				if err := proto.Unmarshal(nsRWSet.Rwset, kvRWSet); err != nil {
-					endorserLogger.Warningf("Failed to unmarshal rwset for namespace %s: %s", namespace, err)
+					logger.Warningf("Failed to unmarshal rwset for namespace %s: %s", namespace, err)
 					continue
 				}
 			}
@@ -335,7 +608,7 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 					} else {
 						dependencies[key] = []byte{}
 					}
-					endorserLogger.Debugf("Transaction read dependency identified: %s", key)
+					logger.Debugf("Transaction read dependency identified: %s", key)
 				}
 			}
 		}
@@ -357,7 +630,7 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 
 				collKVRWSet := &kvrwset.KVRWSet{}
 				if err := proto.Unmarshal(collection.Rwset, collKVRWSet); err != nil {
-					endorserLogger.Warningf("Failed to unmarshal collection rwset for namespace %s, collection %s: %s",
+					logger.Warningf("Failed to unmarshal collection rwset for namespace %s, collection %s: %s",
 						namespace, collectionName, err)
 					continue
 				}
@@ -365,7 +638,7 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 				for _, write := range collKVRWSet.Writes {
 					key := namespace + ":" + collectionName + ":" + string(write.Key)
 					dependencies[key] = write.Value
-					endorserLogger.Debugf("Private data dependency identified: %s", key)
+					logger.Debugf("Private data dependency identified: %s", key)
 				}
 
 				// Similarly, you might track read dependencies for private data
@@ -379,7 +652,7 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 						} else {
 							dependencies[key] = []byte{}
 						}
-						endorserLogger.Debugf("Private data read dependency identified: %s", key)
+						logger.Debugf("Private data read dependency identified: %s", key)
 					}
 				}
 			}
@@ -391,7 +664,7 @@ func (e *Endorser) extractTransactionDependencies(simResult *ledger.TxSimulation
 
 // SimulateProposal simulates the proposal by calling the chaincode
 func (e *Endorser) simulateProposal(txParams *ccprovider.TransactionParams, chaincodeName string, chaincodeInput *pb.ChaincodeInput) (*pb.Response, []byte, *pb.ChaincodeEvent, *pb.ChaincodeInterest, error) {
-	logger := decorateLogger(endorserLogger, txParams)
+	logger := decorateLogger(logger, txParams)
 
 	meterLabels := []string{
 		"channel", txParams.ChannelID,
@@ -522,7 +795,7 @@ func (e *Endorser) ProcessProposal(ctx context.Context, signedProp *pb.SignedPro
 	e.Metrics.ProposalsReceived.Add(1)
 
 	addr := util.ExtractRemoteAddress(ctx)
-	endorserLogger.Debug("request from", addr)
+	logger.Debug("request from", addr)
 
 	// variables to capture proposal duration metric
 	success := false
@@ -530,7 +803,7 @@ func (e *Endorser) ProcessProposal(ctx context.Context, signedProp *pb.SignedPro
 	up, err := UnpackProposal(signedProp)
 	if err != nil {
 		e.Metrics.ProposalValidationFailed.Add(1)
-		endorserLogger.Warnw("Failed to unpack proposal", "error", err.Error())
+		logger.Warnw("Failed to unpack proposal", "error", err.Error())
 		return &pb.ProposalResponse{Response: &pb.Response{Status: 500, Message: err.Error()}}, err
 	}
 
@@ -549,7 +822,7 @@ func (e *Endorser) ProcessProposal(ctx context.Context, signedProp *pb.SignedPro
 	// 0 -- check and validate
 	err = e.preProcess(up, channel)
 	if err != nil {
-		endorserLogger.Warnw("Failed to preProcess proposal", "error", err.Error())
+		logger.Warnw("Failed to preProcess proposal", "error", err.Error())
 		return &pb.ProposalResponse{Response: &pb.Response{Status: 500, Message: err.Error()}}, err
 	}
 
@@ -564,7 +837,7 @@ func (e *Endorser) ProcessProposal(ctx context.Context, signedProp *pb.SignedPro
 
 	pResp, err := e.ProcessProposalSuccessfullyOrError(up)
 	if err != nil {
-		endorserLogger.Warnw("Failed to invoke chaincode", "channel", up.ChannelHeader.ChannelId, "chaincode", up.ChaincodeName, "error", err.Error())
+		logger.Warnw("Failed to invoke chaincode", "channel", up.ChannelHeader.ChannelId, "chaincode", up.ChaincodeName, "error", err.Error())
 		// Return a nil error since clients are expected to look at the ProposalResponse response status code (500) and message.
 		return &pb.ProposalResponse{Response: &pb.Response{Status: 500, Message: err.Error()}}, nil
 	}
@@ -589,7 +862,7 @@ func (e *Endorser) ProcessProposalSuccessfullyOrError(up *UnpackedProposal) (*pb
 		Proposal:   up.Proposal,
 	}
 
-	logger := decorateLogger(endorserLogger, txParams)
+	logger := decorateLogger(logger, txParams)
 
 	if acquireTxSimulator(up.ChannelHeader.ChannelId, up.ChaincodeName) {
 		txSim, err := e.Support.GetTxSimulator(up.ChannelID(), up.TxID())
@@ -836,7 +1109,7 @@ func (e *Endorser) buildChaincodeInterest(simResult *ledger.TxSimulationResults)
 		}
 	}
 
-	endorserLogger.Debug("ccInterest", ccInterest)
+	logger.Debug("ccInterest", ccInterest)
 	return ccInterest, nil
 }
 
@@ -928,4 +1201,131 @@ func CreateCCEventBytes(ccevent *pb.ChaincodeEvent) ([]byte, error) {
 
 func decorateLogger(logger *flogging.FabricLogger, txParams *ccprovider.TransactionParams) *flogging.FabricLogger {
 	return logger.With("channel", txParams.ChannelID, "txID", shorttxid(txParams.TxID))
+}
+
+// forwardToLeader forwards a transaction to the leader endorser with circuit breaker
+func (e *Endorser) forwardToLeader(response *pb.ProposalResponse) error {
+	return e.LeaderCircuitBreaker.Execute(func() error {
+		conn, err := grpc.Dial(
+			e.Config.LeaderEndorser,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+			grpc.WithTimeout(5*time.Second),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to connect to leader endorser: %v", err)
+		}
+		defer conn.Close()
+
+		client := pb.NewEndorserClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		_, err = client.ProcessProposal(ctx, &pb.SignedProposal{
+			ProposalBytes: response.Payload,
+			Signature:     response.Endorsement.Signature,
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to forward transaction to leader: %v", err)
+		}
+
+		return nil
+	})
+}
+
+// runHealthChecks periodically performs health checks
+func (e *Endorser) runHealthChecks() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-e.stopChan:
+			return
+		case <-ticker.C:
+			e.performHealthCheck()
+		}
+	}
+}
+
+// performHealthCheck performs all health checks and updates the status
+func (e *Endorser) performHealthCheck() {
+	e.HealthCheckLock.Lock()
+	defer e.HealthCheckLock.Unlock()
+
+	status := &HealthStatus{
+		IsHealthy:     true,
+		LastCheckTime: time.Now(),
+		Details:       make(map[string]interface{}),
+	}
+
+	// Check dependency map health
+	e.VariableMapLock.RLock()
+	mapSize := len(e.VariableMap)
+	e.VariableMapLock.RUnlock()
+	status.Details["dependencyMapSize"] = mapSize
+
+	// Check leader connectivity for normal endorsers
+	if e.Config.Role == NormalEndorser {
+		if err := e.checkLeaderConnectivity(); err != nil {
+			status.IsHealthy = false
+			status.Details["leaderConnectivity"] = err.Error()
+			e.LeaderCheckError = err
+		} else {
+			status.Details["leaderConnectivity"] = "ok"
+			e.LeaderCheckError = nil
+		}
+	}
+
+	// Check transaction processing channels
+	if e.TxChannel == nil || e.ResponseChannel == nil {
+		status.IsHealthy = false
+		status.Details["channels"] = "transaction channels not initialized"
+	} else {
+		status.Details["channels"] = "ok"
+	}
+
+	// Update health status
+	e.HealthStatus = status
+	logger.Infof("Health check completed. Status: %v, Details: %v", status.IsHealthy, status.Details)
+}
+
+// checkLeaderConnectivity checks if the normal endorser can connect to the leader
+func (e *Endorser) checkLeaderConnectivity() error {
+	if time.Since(e.LastLeaderCheck) < 30*time.Second {
+		return e.LeaderCheckError
+	}
+
+	return e.LeaderCircuitBreaker.Execute(func() error {
+		conn, err := grpc.Dial(
+			e.Config.LeaderEndorser,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+			grpc.WithTimeout(5*time.Second),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to connect to leader: %v", err)
+		}
+		defer conn.Close()
+
+		client := pb.NewEndorserClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		_, err = client.ProcessProposal(ctx, &pb.SignedProposal{})
+		if err != nil {
+			return fmt.Errorf("leader health check failed: %v", err)
+		}
+
+		e.LastLeaderCheck = time.Now()
+		return nil
+	})
+}
+
+// GetHealthStatus returns the current health status of the endorser
+func (e *Endorser) GetHealthStatus() *HealthStatus {
+	e.HealthCheckLock.RLock()
+	defer e.HealthCheckLock.RUnlock()
+	return e.HealthStatus
 }

@@ -1,6 +1,9 @@
 module github.com/hyperledger/fabric
 
-go 1.23
+go 1.23.0
+
+toolchain go1.24.1
+
 require (
 	code.cloudfoundry.org/clock v1.0.0
 	github.com/IBM/idemix v0.0.2-0.20231011101252-a4feda90f3f7
@@ -42,7 +45,7 @@ require (
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.35.0
 	golang.org/x/tools v0.21.1-0.20240508182429-e35e4ccd0d2d
-	google.golang.org/grpc v1.70.0
+	google.golang.org/grpc v1.59.0
 	google.golang.org/protobuf v1.36.5
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 	gopkg.in/yaml.v2 v2.4.0
