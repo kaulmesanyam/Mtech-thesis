@@ -386,8 +386,8 @@ func (lc *LedgerCommitter) legacyCommit(blockAndPvtData *ledger.BlockAndPvtData,
 
 // processBlockWithDAG processes a block using the transaction dependency DAG
 func (lc *LedgerCommitter) processBlockWithDAG(blockAndPvtData *ledger.BlockAndPvtData,
-	commitOpts *ledger.CommitOptions, dag *TransactionDAG) error {
-
+	commitOpts *ledger.CommitOptions, dag *TransactionDAG,
+) error {
 	// Get transactions by level for parallel processing
 	txsByLevel := dag.GetTransactionsByLevel()
 	maxLevel := -1

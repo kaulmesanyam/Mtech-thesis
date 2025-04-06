@@ -66,7 +66,6 @@ var _ = Describe("SignalHandling", func() {
 	})
 
 	It("handles signals", func() {
-
 		if runtime.GOOS == "windows" {
 			Skip("This test requires SIGUSR1 which is not available on Windows")
 		}
