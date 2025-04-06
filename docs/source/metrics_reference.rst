@@ -425,6 +425,8 @@ The following peer metrics are exported for consumption by Prometheus.
 |                                                     |           | have failed.                                               +------------------+-------------------------------------------------------------+
 |                                                     |           |                                                            | chaincode        |                                                             |
 +-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
+| endorser_dependency_map_size                        | gauge     | The current size of the transaction dependency map.        |                  |                                                             |
++-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
 | endorser_duplicate_transaction_failures             | counter   | The number of failed proposals due to duplicate            | channel          |                                                             |
 |                                                     |           | transaction ID.                                            +------------------+-------------------------------------------------------------+
 |                                                     |           |                                                            | chaincode        |                                                             |
@@ -434,6 +436,16 @@ The following peer metrics are exported for consumption by Prometheus.
 |                                                     |           |                                                            | chaincode        |                                                             |
 |                                                     |           |                                                            +------------------+-------------------------------------------------------------+
 |                                                     |           |                                                            | chaincodeerror   |                                                             |
++-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
+| endorser_expired_dependencies_removed               | counter   | The number of expired transaction dependencies removed     |                  |                                                             |
+|                                                     |           | during cleanup.                                            |                  |                                                             |
++-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
+| endorser_leader_circuit_breaker_closed              | counter   | The number of times the leader circuit breaker has closed. |                  |                                                             |
++-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
+| endorser_leader_circuit_breaker_half_open           | counter   | The number of times the leader circuit breaker has entered |                  |                                                             |
+|                                                     |           | half-open state.                                           |                  |                                                             |
++-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
+| endorser_leader_circuit_breaker_open                | counter   | The number of times the leader circuit breaker has opened. |                  |                                                             |
 +-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
 | endorser_proposal_acl_failures                      | counter   | The number of proposals that failed ACL checks.            | channel          |                                                             |
 |                                                     |           |                                                            +------------------+-------------------------------------------------------------+
@@ -455,6 +467,10 @@ The following peer metrics are exported for consumption by Prometheus.
 | endorser_proposals_received                         | counter   | The number of proposals received.                          |                  |                                                             |
 +-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
 | endorser_successful_proposals                       | counter   | The number of successful proposals.                        |                  |                                                             |
++-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
+| endorser_transactions_with_dependencies             | counter   | The number of transactions with dependencies on other      | channel          |                                                             |
+|                                                     |           | transactions.                                              +------------------+-------------------------------------------------------------+
+|                                                     |           |                                                            | chaincode        |                                                             |
 +-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
 | fabric_version                                      | gauge     | The active version of Fabric.                              | version          |                                                             |
 +-----------------------------------------------------+-----------+------------------------------------------------------------+------------------+-------------------------------------------------------------+
@@ -618,10 +634,22 @@ associated with the metric.
 | endorser.chaincode_instantiation_failures.%{channel}.%{chaincode}                       | counter   | The number of chaincode instantiations or upgrade that     |
 |                                                                                         |           | have failed.                                               |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
+| endorser.dependency_map_size                                                            | gauge     | The current size of the transaction dependency map.        |
++-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
 | endorser.duplicate_transaction_failures.%{channel}.%{chaincode}                         | counter   | The number of failed proposals due to duplicate            |
 |                                                                                         |           | transaction ID.                                            |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
 | endorser.endorsement_failures.%{channel}.%{chaincode}.%{chaincodeerror}                 | counter   | The number of failed endorsements.                         |
++-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
+| endorser.expired_dependencies_removed                                                   | counter   | The number of expired transaction dependencies removed     |
+|                                                                                         |           | during cleanup.                                            |
++-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
+| endorser.leader_circuit_breaker_closed                                                  | counter   | The number of times the leader circuit breaker has closed. |
++-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
+| endorser.leader_circuit_breaker_half_open                                               | counter   | The number of times the leader circuit breaker has entered |
+|                                                                                         |           | half-open state.                                           |
++-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
+| endorser.leader_circuit_breaker_open                                                    | counter   | The number of times the leader circuit breaker has opened. |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
 | endorser.proposal_acl_failures.%{channel}.%{chaincode}                                  | counter   | The number of proposals that failed ACL checks.            |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
@@ -635,6 +663,9 @@ associated with the metric.
 | endorser.proposals_received                                                             | counter   | The number of proposals received.                          |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
 | endorser.successful_proposals                                                           | counter   | The number of successful proposals.                        |
++-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
+| endorser.transactions_with_dependencies.%{channel}.%{chaincode}                         | counter   | The number of transactions with dependencies on other      |
+|                                                                                         |           | transactions.                                              |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+
 | fabric_version.%{version}                                                               | gauge     | The active version of Fabric.                              |
 +-----------------------------------------------------------------------------------------+-----------+------------------------------------------------------------+

@@ -1478,6 +1478,18 @@ func setupTestConfig() {
 	if err != nil {
 		panic(fmt.Errorf("Could not initialize BCCSP Factories [%s]", err))
 	}
+
+	// Remove existing test directory if it exists
+	if err := os.RemoveAll("testdata"); err != nil {
+		fmt.Printf("Failed to remove test directory: %s", err)
+		os.Exit(-1)
+	}
+
+	// Create test directory
+	if err := os.MkdirAll("testdata", 0o755); err != nil {
+		fmt.Printf("Failed to create test directory: %s", err)
+		os.Exit(-1)
+	}
 }
 
 var signer msp.SigningIdentity

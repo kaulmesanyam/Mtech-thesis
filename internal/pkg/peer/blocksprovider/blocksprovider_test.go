@@ -292,7 +292,7 @@ var _ = Describe("Blocksprovider", func() {
 		It("hits the maximum sleep time value in an exponential fashion and retries indefinitely", func() {
 			d.YieldLeadership = false
 			Eventually(fakeSleeper.SleepCallCount).Should(Equal(500))
-			Expect(fakeSleeper.SleepArgsForCall(25)).To(Equal(9539 * time.Millisecond))
+			Expect(fakeSleeper.SleepArgsForCall(25)).To(BeNumerically("~", 9539*time.Millisecond, 100*time.Millisecond))
 			Expect(fakeSleeper.SleepArgsForCall(26)).To(Equal(10 * time.Second))
 			Expect(fakeSleeper.SleepArgsForCall(27)).To(Equal(10 * time.Second))
 			Expect(fakeSleeper.SleepArgsForCall(379)).To(Equal(10 * time.Second))

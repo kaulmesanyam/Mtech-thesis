@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -69,6 +70,18 @@ type peerIdentityAcceptor func(identity api.PeerIdentityType) error
 type joinChanMsg struct{}
 
 func init() {
+	// Remove existing test directory if it exists
+	if err := os.RemoveAll("testdata"); err != nil {
+		fmt.Printf("Failed to remove test directory: %s", err)
+		os.Exit(-1)
+	}
+
+	// Create test directory
+	if err := os.MkdirAll("testdata", 0o755); err != nil {
+		fmt.Printf("Failed to create test directory: %s", err)
+		os.Exit(-1)
+	}
+
 	gossiputil.SetupTestLogging()
 	factory.InitFactories(nil)
 }

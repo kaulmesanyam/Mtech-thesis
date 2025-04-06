@@ -69,6 +69,11 @@ func TestMain(m *testing.M) {
 	}
 	defer gexec.CleanupBuildArtifacts()
 
+	// Remove existing temp directory if it exists
+	if tempDir != "" {
+		os.RemoveAll(tempDir)
+	}
+
 	tempDir, err = ioutil.TempDir("", "main-test")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create temporary directory: %v", err)

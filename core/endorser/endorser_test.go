@@ -20,6 +20,7 @@ import (
 	"github.com/hyperledger/fabric/core/chaincode/lifecycle"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
 	"github.com/hyperledger/fabric/core/endorser"
+	"github.com/hyperledger/fabric/core/endorser/mocks"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/protoutil"
 	. "github.com/onsi/ginkgo/v2"
@@ -142,14 +143,23 @@ var _ = Describe("Endorser", func() {
 
 func TestEndorserDependencyTracking(t *testing.T) {
 	t.Run("Dependency Tracking", func(t *testing.T) {
+		// Create mock objects
+		support := &mocks.Support{}
+		chaincodeSupport := &mocks.ChaincodeSupport{}
+		aclProvider := &mocks.ACLProvider{}
 		metrics := endorser.NewMetrics(&metricsfakes.Provider{})
-		support := &mockSupport{}
+
+		// Set up mock expectations
+		chaincodeSupport.On("Channel", "test-channel").Return(&endorser.Channel{
+			IdentityDeserializer: aclProvider,
+		})
+
+		// Create endorser config
 		config := endorser.EndorserConfig{
-			Role:       endorser.LeaderEndorser,
-			EndorserID: "test-endorser",
-			ChannelID:  "test-channel",
+			Role:      endorser.NormalEndorser,
+			ChannelID: "test-channel",
 		}
-		e := endorser.NewEndorser(nil, nil, nil, support, nil, metrics, config)
+		e := endorser.NewEndorser(chaincodeSupport, aclProvider, nil, support, nil, metrics, config)
 
 		// Create a test proposal
 		proposal := createTestProposal("test-key", "test-value")

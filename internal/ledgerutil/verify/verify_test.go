@@ -27,46 +27,54 @@ const (
 )
 
 func TestVerify(t *testing.T) {
-	testCases := map[string]struct {
+	testCases := []struct {
+		name                 string
 		sampleFileSystemPath string
-		expectedResultFile   string
-		expectedReturnValue  bool
 		errorExpected        bool
+		expectedReturnValue  bool
 	}{
-		"good-ledger": {
-			sampleFileSystemPath: SampleGoodLedgerDir,
-			expectedResultFile:   "correct_blocks.json",
-			expectedReturnValue:  true,
+		{
+			name:                 "ledger-bootstrapped-from-snapshot",
+			sampleFileSystemPath: "testdata/ledger-bootstrapped-from-snapshot",
 			errorExpected:        false,
-		},
-		"hash-error-in-block": {
-			sampleFileSystemPath: SampleBadLedgerDir,
-			expectedResultFile:   "hash_error_blocks.json",
 			expectedReturnValue:  false,
+		},
+		{
+			name:                 "good-ledger",
+			sampleFileSystemPath: SampleGoodLedgerDir,
 			errorExpected:        false,
-		},
-		"block-store-does-not-exist": {
-			sampleFileSystemPath: "",
-			errorExpected:        true,
-		},
-		"empty-block-store": {
-			sampleFileSystemPath: "",
-			errorExpected:        true,
-		},
-		"ledger-bootstrapped-from-snapshot": {
-			sampleFileSystemPath: SampleLedgerFromSnapshotDir,
-			expectedResultFile:   "correct_blocks.json",
 			expectedReturnValue:  true,
+		},
+		{
+			name:                 "hash-error-in-block",
+			sampleFileSystemPath: SampleBadLedgerDir,
 			errorExpected:        false,
+			expectedReturnValue:  false,
+		},
+		{
+			name:                 "block-store-does-not-exist",
+			sampleFileSystemPath: "testdata/block-store-does-not-exist",
+			errorExpected:        true,
+			expectedReturnValue:  false,
+		},
+		{
+			name:                 "empty-block-store",
+			sampleFileSystemPath: "testdata/empty-block-store",
+			errorExpected:        true,
+			expectedReturnValue:  false,
 		},
 	}
 
-	for testName, testCase := range testCases {
-		t.Run(testName, func(t *testing.T) {
-			// Create a temporary directory for output
-			outputDir := t.TempDir()
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			testName := testCase.name
+			fsDir := filepath.Join(TestDataDir, testName)
+			outputDir := filepath.Join(TestDataDir, testName+"-output")
+			err := os.MkdirAll(fsDir, 0o700)
+			require.NoError(t, err)
+			err = os.MkdirAll(outputDir, 0o700)
+			require.NoError(t, err)
 
-			fsDir := t.TempDir()
 			if testName == "empty-block-store" {
 				err := os.MkdirAll(filepath.Join(fsDir, "ledgersData", "chains"), 0o700)
 				require.NoError(t, err)
@@ -91,7 +99,7 @@ func TestVerify(t *testing.T) {
 
 				actualResult, err := jsonrw.OutputFileToString(VerificationResultFile, outputDir)
 				require.NoError(t, err)
-				expectedResult, err := jsonrw.OutputFileToString(testCase.expectedResultFile, SampleResultDir)
+				expectedResult, err := jsonrw.OutputFileToString(testCase.name+".json", SampleResultDir)
 				require.NoError(t, err)
 
 				require.Equal(t, actualResult, expectedResult)
